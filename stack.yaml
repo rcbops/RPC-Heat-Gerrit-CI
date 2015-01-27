@@ -1,0 +1,721 @@
+heat_template_version: 2013-05-23
+
+description: |
+  Template for deploying gerrit and jenkins for continuous integration.
+  Deploys an instance with Salt-Master.
+  Deploys an instance with Gerrit for code review.
+  Deploys an instance with Jenkins master.
+  Deploys a number of instances as Jenkins slaves.
+
+parameter_groups:
+  - parameters:
+    - keyname
+    - image
+    - floating-network-id
+    - slave-count
+    - flavor
+
+parameters:
+
+  keyname:
+    type: string
+    label: Salt-Master Keyname.
+    description: The name of the key that should be used to ssh into the Salt-Master.
+
+  image:
+    type: string
+    label: Image Name
+    description: Name of the existing image to use for every vm spun up by this stack. The image should have heat-config and heat-config-script baked in.
+
+  floating-network-id:
+    type: string
+    label: External Network UUID
+    description: UUID of the external network. The private network created by this stack will route to this network. Also, any floating ip's needed by this stack will come this network.
+
+  slave-count:
+    type: number
+    default: 2
+    label: Number of Jenkins slaves.
+    description: The number of Jenkins slaves.
+
+  flavor:
+    type: string
+    label: Flavor
+    description: Flavor of all vms. This may be changed in the future to allow different flavors for the different vms in this stack.
+    default: m1.small
+
+resources:
+
+  # Random string to aid in naming things.
+  stack-string:
+    type: OS::Heat::RandomString
+    properties:
+      length: 6
+      sequence: lettersdigits
+
+  # Will be used to generate a random password
+  # 32 characters long consisting of alpha numeric characters
+  dbsecret:
+    type: OS::Heat::RandomString
+    properties:
+      length: 32
+      sequence: lettersdigits
+
+  # Will be used to generate a random password
+  # 32 characters long consisting of alpha numeric characters.
+  jenkinssecret:
+    type: OS::Heat::RandomString
+    properties:
+      length: 12
+      sequence: lettersdigits
+
+  # Security group
+  secgroup:
+    type: OS::Neutron::SecurityGroup
+    properties:
+      name:
+        str_replace:
+          template: gerrit-ci-$stackstr-secgroup
+          params:
+            $stackstr:
+              get_attr:
+                - stack-string
+                - value
+      rules:
+        - protocol: icmp
+        - protocol: tcp
+          port_range_min: 22
+          port_range_max: 22
+        - protocol: tcp
+          port_range_min: 443
+          port_range_max: 443
+        - protocol: tcp
+          port_range_min: 80
+          port_range_max: 80
+        - protocol: tcp
+          port_range_min: 4505
+          port_range_max: 4606
+        - protocol: tcp
+          port_range_min: 29418
+          port_range_max: 29418
+
+  # Keypair for communicating between nodes within the stack.
+  # Will allow minions to ssh into the master and vice versa.
+  coms:
+    type: OS::Nova::KeyPair
+    properties:
+      save_private_key: true
+      name:
+        str_replace:
+          template: gerrit-ci-$stackstr-coms
+          params:
+            $stackstr:
+              get_attr:
+                - stack-string
+                - value
+
+  # Private network for this stack
+  net:
+    type: OS::Neutron::Net
+
+  # Private subnet for this stack
+  subnet:
+    type: OS::Neutron::Subnet
+    properties:
+      network_id:
+        get_resource: net
+      cidr: 10.20.20.0/24
+      dns_nameservers:
+        - 8.8.8.8
+        - 4.2.2.2
+
+  # Routes the private network to the external network.
+  router:
+    type: OS::Neutron::Router
+    properties:
+      external_gateway_info:
+        network:
+          get_param: floating-network-id
+
+  # Router interface
+  interface:
+    type: OS::Neutron::RouterInterface
+    properties:
+      router_id:
+        get_resource: router
+      subnet_id:
+        get_resource: subnet
+
+  # One floating ip for the salt-master node
+  master-ip:
+    type: OS::Neutron::FloatingIP
+    properties:
+      floating_network_id:
+        get_param: floating-network-id
+
+  # One port for the salt-master node
+  master-port:
+    type: OS::Neutron::Port
+    properties:
+      network_id:
+        get_resource: net
+      security_groups:
+        - get_resource: secgroup
+
+  # Software configuration script for the salt-master node
+  # Installs salt-master, sets permission on some personality files
+  # and uses git to clone any provided state/formula repos
+  config-salt-master:
+    type: OS::Heat::SoftwareConfig
+    properties:
+      group: script
+      inputs:
+        - name: public_key
+        - name: state_repos
+      config: |
+        #!/bin/bash
+        set -ex
+        logdir=/var/log/heat-deployments
+        prefix=${logdir}/config-salt-master
+        mkdir -p $logdir
+        exec &> >(tee -a ${prefix}.log)
+        [ -e ${prefix}.ran ] && exit 0
+
+        chmod -R 0600 ${logdir}
+        chmod 0700 /root/.ssh/coms_rsa
+        chmod 0600 /srv/pillar/gerrit_ci/init.sls
+
+        # Add coms from minions to master
+        echo "$public_key" >> /root/.ssh/authorized_keys
+
+        # Install git
+        apt-get install -y git
+
+        # Install salt master
+        echo "Install Salt Master"
+        curl -L http://bootstrap.saltstack.org | sh -s -- -M -N git v2014.1.13
+        mkdir -p /srv/salt
+        echo -e 'file_roots:\n  base:\n    - /srv/salt' >> /etc/salt/master
+
+        # Clone state/formula repos in state root directory
+        cd /srv/salt
+        while read -r line
+        do
+            if [ -n "$line" ]; then
+                git clone $line
+            fi
+        done <<< "$state_repos"
+
+        mv /srv/salt/gerrit-ci-formula /srv/salt/gerrit_ci
+
+        # Finally - Restart salt service
+        service salt-master restart
+
+        touch ${prefix}.ran
+
+  # Software configuration for salt minion
+  # Installs salt-minion, sets up authentication from minion to master,
+  # and sets permissions of any personality files.
+  config-salt-minion:
+    type: OS::Heat::SoftwareConfig
+    properties:
+      group: script
+      inputs:
+        - name: public_key
+        - name: master
+      config: |
+        #!/bin/bash
+        set -ex
+        logdir=/var/log/heat-deployments
+        prefix=${logdir}/config-salt-minion
+        mkdir -p $logdir
+        exec &> >(tee -a ${prefix}.log)
+        [ -e ${prefix}.ran ] && exit 0
+
+        chmod -R 0600 ${logdir}
+        chmod 0700 /root/.ssh/coms_rsa
+
+        # Add coms from minions to master
+        echo "$public_key" >> /root/.ssh/authorized_keys
+
+        # Install salt minion
+        curl -L http://bootstrap.saltstack.org | sh -s -- git v2014.1.13
+        echo master: $master >> /etc/salt/minion
+
+        service salt-minion restart
+
+        ssh-keyscan -H $master >> /root/.ssh/known_hosts
+
+        MASTER_PKI_PATH="/etc/salt/pki/master/minions/"
+        MASTER_PKI_PATH_PRE="/etc/salt/pki/master/minions_pre/"
+        MINION_PKI_PATH="/etc/salt/pki/minion/minion.pub"
+        HOSTNAME="$(python  -c 'import socket; print socket.getfqdn()')"
+
+        while [ ! -s ${MINION_PKI_PATH} ]; do
+            echo "Waiting for ${MINION_PKI_PATH} to have non-zero content."
+            sleep 2
+        done
+
+        cp $MINION_PKI_PATH /root/minion_key
+
+        scp -i /root/.ssh/coms_rsa /root/minion_key root@$master:/tmp/$HOSTNAME
+
+        ssh -i /root/.ssh/coms_rsa root@$master "mv /tmp/$HOSTNAME $MASTER_PKI_PATH$HOSTNAME; chmod 700 $MASTER_PKI_PATH$HOSTNAME; rm $MASTER_PKI_PATH_PRE$HOSTNAME"
+
+        service salt-minion restart
+        rm /root/minion_key
+        rm /root/.ssh/coms_rsa
+        touch ${prefix}.ran
+
+  # Software deployment for salt-master. Deploys the salt-master softrware
+  # configuration.
+  deploy-salt-master:
+    type: OS::Heat::SoftwareDeployment
+    properties:
+      input_values:
+        public_key:
+          get_attr:
+            - coms
+            - public_key
+        state_repos: |
+          https://github.com/rcbops/gerrit-ci-formula.git
+      config:
+        get_resource: config-salt-master
+      server:
+        get_resource: master
+
+  # The salt master instance
+  # Should have one floating ip
+  master:
+    type: OS::Nova::Server
+    depends_on: interface
+    properties:
+      key_name:
+        get_param: keyname
+      image:
+        get_param: image
+      flavor:
+        get_param: flavor
+      name:
+        str_replace:
+          template: gerrit-ci-$stackstr-master
+          params:
+            $stackstr:
+              get_attr:
+                - stack-string
+                - value
+      personality:
+
+        # Private key for ssh'ing into minions
+        /root/.ssh/coms_rsa:
+          get_attr:
+            - coms
+            - private_key
+
+        # The top.sls file for salt states.
+        # Dictates which minions get which formulas
+        /srv/salt/top.sls: |
+          base:
+            'roles:gerrit':
+              - match: grain
+              - gerrit_ci
+            'roles:jenkins':
+              - match: grain
+              - gerrit_ci
+            'roles:jenkins_slave':
+              - match: grain
+              - gerrit_ci.jenkins.slave
+
+        # The top.sls file for salt pillars.
+        # Dictates which minions get which pillars.
+        /srv/pillar/top.sls: |
+          base:
+            'G@roles:gerrit or G@roles:jenkins or G@roles:jenkins_slave':
+              - match: compound
+              - gerrit_ci
+
+        /srv/pillar/gerrit_ci/init.sls:
+          str_replace:
+            template: |
+              interfaces:
+                public: eth0
+                private: eth2
+              mine_functions:
+                network.ip_addrs: [eth0]
+                grains.get: [num_cpus]
+              mine_interval: 1
+              gerrit:
+                version: 2.9.3
+                canonicalWebUrl: https://$gerritip/
+                http_virtual_host: '*:80'
+                https_virtual_host: '*:443'
+                https_url: https://$gerritip/
+                server_name: $gerritip
+                proxy_pass_url: http://127.0.0.1:8081/
+                sshdlistenaddress: '*:29418'
+                httpdlistenurl: proxy-https://127.0.0.1:8081/r/
+              {% if 'gerrit' in salt['grains.get']('roles', []) %}
+                dbname: gerrit
+                dbhost: localhost
+                dbuserhost: localhost
+                dbuser: gerrit
+                dbpassword: $dbpassword
+              {% endif %}
+              {% if 'jenkins' in salt['grains.get']('roles', []) %}
+              jenkins:
+                username: jenkins
+                password: $jenkinspassword
+                server_name: $jenkinsip
+                https_url: https://$jenkinsip/
+                gerrit:
+                  frontEndUrl: https://$gerritip/
+              {% endif %}
+            params:
+              $dbpassword:
+                get_attr:
+                  - dbsecret
+                  - value
+              $jenkinspassword:
+                get_attr:
+                  - jenkinssecret
+                  - value
+              $jenkinsip:
+                get_attr:
+                  - minion-jenkins-ip
+                  - floating_ip_address
+              $gerritip:
+                get_attr:
+                  - minion-gerrit-ip
+                  - floating_ip_address
+
+      # Get access from the master-port
+      networks:
+        - port:
+            get_resource: master-port
+
+      # Using SoftwareConfigs - This needs to be set to SOFTWARE_CONFIG
+      user_data_format: SOFTWARE_CONFIG
+
+  # Associate the master floating ip to the master port
+  master-floating-ip-ass:
+    type: OS::Neutron::FloatingIPAssociation
+    properties:
+      floatingip_id:
+        get_resource: master-ip
+      port_id:
+        get_resource: master-port
+
+  # Deploys a group of (vms + software deployment).
+  # This group the varying number of web servers.
+  # Each instance in this group will be an instance with salt-minion
+  # installed and will have the salt role of 'web'
+  minion-group-slaves:
+    type: OS::Heat::ResourceGroup
+    depends_on: deploy-salt-master
+    properties:
+      count:
+        get_param: slave-count
+      resource_def:
+        type: Salt::Minion
+        properties:
+          flavor:
+            get_param: flavor
+          stack-prefix:
+            str_replace:
+              template: gerrit-ci-$stackstr-jenkins-slave
+              params:
+                $stackstr:
+                  get_attr:
+                    - stack-string
+                    - value
+          private_key:
+            get_attr:
+              - coms
+              - private_key
+          public_key:
+            get_attr:
+              - coms
+              - public_key
+          image:
+            get_param: image
+          network:
+            get_resource: net
+          master:
+            get_attr:
+              - master
+              - first_address
+          minion-config:
+            get_resource: config-salt-minion
+          minion-roles: "jenkins_slave"
+          security-group:
+            get_resource: secgroup
+
+  # Floating ip for gerrit node
+  minion-gerrit-ip:
+    type: OS::Neutron::FloatingIP
+    properties:
+      floating_network_id:
+        get_param: floating-network-id
+
+  # Port for gerrit node
+  minion-gerrit-port:
+    type: OS::Neutron::Port
+    properties:
+      network_id:
+        get_resource: net
+      security_groups:
+        - get_resource: secgroup
+
+  # Gerrit minion
+  minion-gerrit:
+    type: OS::Nova::Server
+    depends_on: interface
+    properties:
+      flavor:
+        get_param: flavor
+      image:
+        get_param: image
+      name:
+        str_replace:
+          template: gerrit-ci-$stackstr-gerrit
+          params:
+            $stackstr:
+              get_attr:
+                - stack-string
+                - value
+      personality:
+
+        # Private key for node to node communication
+        /root/.ssh/coms_rsa:
+          get_attr:
+            - coms
+            - private_key
+
+        # Set the salt role to gerrit
+        /etc/salt/grains: |
+          roles:
+            - gerrit
+
+      networks:
+        - port:
+            get_resource: minion-gerrit-port
+
+      # Needs to be SOFTWARE_CONFIG when using SoftwareConfigs
+      user_data_format: SOFTWARE_CONFIG
+
+  # Associate gerrit floating ip to the port
+  minion-gerrit-floating-ip-ass:
+    type: OS::Neutron::FloatingIPAssociation
+    properties:
+      floatingip_id:
+        get_resource: minion-gerrit-ip
+      port_id:
+        get_resource: minion-gerrit-port
+
+  # Deploys the salt-minion software config to the gerrit node.
+  deploy-gerrit:
+    type: OS::Heat::SoftwareDeployment
+    depends_on: deploy-salt-master
+    properties:
+      input_values:
+        public_key:
+          get_attr:
+            - coms
+            - public_key
+        master:
+          get_attr:
+            - master
+            - first_address
+      config:
+        get_resource: config-salt-minion
+      server:
+        get_resource: minion-gerrit
+
+  # Floating ip for jenkins node
+  minion-jenkins-ip:
+    type: OS::Neutron::FloatingIP
+    properties:
+      floating_network_id:
+        get_param: floating-network-id
+
+  # Port for jenkins node
+  minion-jenkins-port:
+    type: OS::Neutron::Port
+    properties:
+      network_id:
+        get_resource: net
+      security_groups:
+        - get_resource: secgroup
+
+  # Gerrit minion
+  minion-jenkins:
+    type: OS::Nova::Server
+    depends_on: interface
+    properties:
+      flavor:
+        get_param: flavor
+      image:
+        get_param: image
+      name:
+        str_replace:
+          template: gerrit-ci-$stackstr-jenkins
+          params:
+            $stackstr:
+              get_attr:
+                - stack-string
+                - value
+      personality:
+
+        # Private key for node to node communication
+        /root/.ssh/coms_rsa:
+          get_attr:
+            - coms
+            - private_key
+
+        # Set the salt role to jenkins
+        /etc/salt/grains: |
+          roles:
+            - jenkins
+
+      networks:
+        - port:
+            get_resource: minion-jenkins-port
+
+      # Needs to be SOFTWARE_CONFIG when using SoftwareConfigs
+      user_data_format: SOFTWARE_CONFIG
+
+  # Associate gerrit floating ip to the port
+  minion-jenkins-floating-ip-ass:
+    type: OS::Neutron::FloatingIPAssociation
+    properties:
+      floatingip_id:
+        get_resource: minion-jenkins-ip
+      port_id:
+        get_resource: minion-jenkins-port
+
+  # Deploys the salt-minion software config to the gerrit node.
+  deploy-jenkins:
+    type: OS::Heat::SoftwareDeployment
+    depends_on: deploy-salt-master
+    properties:
+      input_values:
+        public_key:
+          get_attr:
+            - coms
+            - public_key
+        master:
+          get_attr:
+            - master
+            - first_address
+      config:
+        get_resource: config-salt-minion
+      server:
+        get_resource: minion-jenkins
+
+  # SoftwareConfig that is to run on master.
+  # Executes a salt state.highstate on all attached minions.
+  config-deploy:
+    type: OS::Heat::SoftwareConfig
+    properties:
+      group: script
+      config: |
+        #!/bin/bash
+        set -ex
+        logdir=/var/log/heat-deployments
+        prefix=${logdir}/config-deploy
+        mkdir -p $logdir
+        exec &> >(tee -a ${prefix}.log)
+        [ -e ${prefix}.ran ] && exit 0
+        cd /srv/salt/gerrit_ci
+        bash setup.sh
+        salt '*' saltutil.refresh_pillar
+        salt '*' mine.update
+        salt-run state.sls gerrit_ci.runner
+        touch ${prefix}.ran
+
+  # Deploys the the deploy softwareconfig
+  # All minions should be spun up and running salt-minion
+  # before executing this deployment.
+  # Note: each minion can run state.highstate independently of the others
+  # as long as the others have updated the salt mine. That is why we wait
+  # for all minions to be up and running.
+  deploy:
+    type: OS::Heat::SoftwareDeployment
+    properties:
+      config:
+        get_resource: config-deploy
+      server:
+        get_resource: master
+    depends_on:
+      - deploy-salt-master
+      - minion-group-slaves
+      - deploy-gerrit
+      - deploy-jenkins
+
+outputs:
+  master-ip:
+    description: SSH here first to get to the other VMs
+    value:
+      get_attr:
+        - master-ip
+        - floating_ip_address
+
+  jenkins-url:
+    description:  Address of jenkins.
+    value:
+      str_replace:
+        template: https://$jenkinsip/
+        params:
+          $jenkinsip:
+            get_attr:
+              - minion-jenkins-ip
+              - floating_ip_address
+
+  jenkins-username:
+    description: Username used to log into jenkins
+    value: jenkins
+
+  jenkins-password:
+    description: Password used to log into jenkins
+    value:
+      get_attr:
+        - jenkinssecret
+        - value
+
+  gerriturl:
+    description: Address of gerrit
+    value:
+      str_replace:
+        template: https://$gerritip/
+        params:
+          $gerritip:
+            get_attr:
+              - minion-gerrit-ip
+              - floating_ip_address
+
+  gerrit-admin-user:
+    description: Username of first admin user. Needed to make a person user admin.
+    value: gerritadmin
+
+  # Uncomment the stdout's and stderr's if problems are occuring.
+  #master-stdout:
+  #  value:
+  #    get_attr:
+  #     - deploy-salt-master
+  #     - deploy_stdout
+  #master-stderr:
+  #  value:
+  #    get_attr:
+  #      - deploy-salt-master
+  #      - deploy_stderr
+
+  #minion-web-stdout:
+  #  value:
+  #    get_attr:
+  #      - minion-group-web
+  #      - minion-stdout
+  #minion-web-stderr:
+  #  value:
+  #    get_attr:
+  #      - minion-group-web
+  #      - minion-stderr
