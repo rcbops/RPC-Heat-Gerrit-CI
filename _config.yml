@@ -1,0 +1,29 @@
+# Site settings
+title: Rackspace Private Cloud Templates
+release: v1.0.0
+template_name: Gerrit CI
+description: >
+  The landing page for Rackspace Private Cloud Custom Heat Solutions
+twitter_username: rackspace
+github_username:  rcbops
+
+# Common URLs
+faq_url: http://docs.rackspace.com/rpc/api/v10/rpc-faq-v10/content/rpc-common-front.html
+release_notes_url: &release_notes_url http://docs.rackspace.com/rpc/api/v10/bk-rpc-releasenotes/content/rpc-common-front.html
+project_url: &project_url https://github.com/rcbops/RPC-Heat-Gerrit-CI
+releases_url: &releases_url https://github.com/rcbops/RPC-Heat-Gerrit-CI/releases/
+latest_release_url: *releases_url # CHANGE ME
+
+# Build settings
+markdown: kramdown
+
+# Navigation Links
+links:
+  - name: Private Cloud
+    href: http://www.rackspace.com/cloud/private/
+  - name: Documentation
+    href: *release_notes_url
+  - name: Download
+    href: *releases_url
+  - name: GitHub
+    href: *project_url
