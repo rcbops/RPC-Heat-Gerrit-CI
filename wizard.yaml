@@ -1,24 +1,25 @@
 name: Gerrit CI
 release: 1.0
+logo: assets/logo.png
+
 short_desc: |
-  RPC-Gerrit-CI delivers a deployable continuous integration platform consisting of Gerrit Code Review and Jenkins using the Heat orchestration engine available in any Rackspace OpenStack Private Cloud.
+  RPC-Gerrit-CI delivers a deployable continuous integration platform consisting of Gerrit Code Review and Jenkins using OpenStack Orchestration (heat) that is available in any Rackspace OpenStack Private Cloud.
 long_desc: |
   Gerrit Code Review is a code review system that provides a web user interface on top of the Git version control system. Code changes are displayed side by side and reviewers may add inline comments. Jenkins is an application for monitoring repeated executions of jobs. Combining Jenkins with Gerrit Code Review provides a simple way to facilitate continuous integration.
+
 architecture: |
   This heat template will provide the following:
   - One salt-master instance (for deployment and configuration management after deployment)
-  - One gerrit instance with MySQL
+  - One Gerrit instance with MySQL
   - One jenkins-master instance
-  - A variable number of jenkins slaves.
-design_specs: |
-  - Communication between jenkins and gerrit happens through ssh. The pain of managing ssh keys is removed by deploying through this template.
+  - A variable number of Jenkins slaves.
+
+design_specs:
+  - Communication between jenkins and gerrit happens through ssh. The difficulty of managing ssh keys is removed by deploying through this template.
   - The gerrit-trigger plugin is automatically configured to allow Gerrit to stream code review events to Jenkins to trigger jobs.
   - SSL termination is offloaded to apache on both the Gerrit and Jenkins nodes.
   - Gerrit authentication is configured to use Ubuntu SSO making Gerrit user account management a breeze.
   - Network isolation and security group isolation at various levels within the stack provide enhanced Cloud security.
-questions:
-  - keyname: Choose an SSH keypair for access to the Salt Master.
-  - image: Choose an image every instance in the stack will use.
-  - floating-network-id: Choose an external network.
-  - slave-count: Choose the number of jenkins slave instances.
-  - flavor: Choose the flavor every instance in the stack will use.
+
+heat_template: stack.yaml
+env_file: env.yaml
