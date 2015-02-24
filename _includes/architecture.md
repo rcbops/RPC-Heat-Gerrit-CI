@@ -4,4 +4,4 @@ This heat template will provide the following:
 after deployment)
 - One Gerrit instance with MySQL
 - One jenkins-master instance
-- A variable number of Jenkins slaves.
+- A variable number of Jenkins slaves
