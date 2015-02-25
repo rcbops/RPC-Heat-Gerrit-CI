@@ -9,6 +9,7 @@ long_desc: |
 
 architecture: |
   This heat template provides the following:
+  
   - One salt-master instance (for deployment and configuration management after deployment)
   - One Gerrit instance with MySQL
   - One jenkins-master instance
